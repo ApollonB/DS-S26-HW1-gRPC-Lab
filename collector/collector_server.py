@@ -1,55 +1,21 @@
-"""
-📘 What the Collector Service Does (Student Explanation)
-
-The collector service is the central component of the telemetry system. Its job is to receive sensor measurements, aggregate them, and provide access to those aggregates to other services.
-In a real industrial telemetry pipeline, the collector typically:
-    Receives continuous sensor measurements via streaming RPC.
-    Stores aggregated statistics in a shared datastore (Redis in this lab).
-    Streams updated aggregate values to monitoring dashboards.
-    Provides an on-demand query interface for inspecting specific sensors.
-
-To support these requirements, the collector exposes three gRPC services:
-1️⃣ IngestService — Client Streaming RPC
-    Sensors connect to this service and continuously stream measurements.
-    Your future implementation will:
-    Accept a stream of Measurement messages.
-    Update Redis aggregates.
-    Maintain recent sensor history.
-    Return an acknowledgment.
-    This demonstrates client-streaming RPC.
-
-2️⃣ AggregateService — Server Streaming RPC
-    Other services (like the FastAPI bridge) subscribe to this service to receive live aggregate updates.
-    Your future implementation will:
-    Periodically read Redis aggregates.
-    Stream updates when values change.
-    Continue until the client disconnects.
-    This demonstrates server-streaming RPC.
-
-3️⃣ QueryService — Unary RPC
-    This service allows clients to request statistics for a specific sensor.
-    Your future implementation will:
-    Retrieve per-sensor statistics from Redis.
-    Return recent values and aggregate metrics.
-    This demonstrates a standard unary RPC.
-
-For now, these services are provided as placeholders so the collector process can run while you focus on defining the protobuf services and implementing the RPC logic.
-"""
 import asyncio
 import time
-from collections import defaultdict
+import json
+import argparse
+import os
 
 import grpc
+import redis.asyncio as redis
+
+from collections import defaultdict
 
 from proto import telemetry_pb2
 from proto import telemetry_pb2_grpc
 
-import redis.asyncio as redis
-import argparse
-import json
-import os
+# --------------------------------------------------
+# Redis Configuration
+# --------------------------------------------------
 
-# redis_client = redis.Redis(host="redis", port=6379, decode_responses=True)
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
@@ -59,56 +25,39 @@ redis_client = redis.Redis(
     decode_responses=True
 )
 
-# -----------------------------
-# In-memory aggregation store
-# -----------------------------
-class AggregationStore:
-    def __init__(self):
-        # key = (sensor_type, location)
-        self.data = defaultdict(
-            lambda: {"count": 0, "sum": 0.0, "min": float("inf"), "max": float("-inf")}
-        )
 
-    def update(self, measurement):
-        key = (measurement.meta.sensor_type, measurement.meta.location)
-
-        entry = self.data[key]
-        entry["count"] += 1
-        entry["sum"] += measurement.value
-        entry["min"] = min(entry["min"], measurement.value)
-        entry["max"] = max(entry["max"], measurement.value)
-
-    def snapshot(self):
-        return dict(self.data)
-
+# --------------------------------------------------
+# Async Aggregation Store
+# --------------------------------------------------
 
 class AggregationStoreAsync:
+
     async def update(self, measurement):
+
         type_loc_key = f"agg:{measurement.meta.sensor_type}:{measurement.meta.location}"
         sensor_stats_key = f"sensor:{measurement.meta.sensor_id}:stats"
         sensor_recent_key = f"sensor:{measurement.meta.sensor_id}:recent"
 
-        # Atomic-ish update using pipeline
-        async with redis_client.pipeline(transaction=True) as pipe:
-            while True:
-                try:
+        while True:
+            try:
+                async with redis_client.pipeline(transaction=True) as pipe:
+
                     await pipe.watch(type_loc_key, sensor_stats_key)
 
-                     # --- GLOBAL AGGREGATION ---
                     global_current = await pipe.hgetall(type_loc_key)
+
                     g_count = int(global_current.get("count", 0)) + 1
                     g_sum = float(global_current.get("sum", 0)) + measurement.value
                     g_min = min(float(global_current.get("min", measurement.value)), measurement.value)
                     g_max = max(float(global_current.get("max", measurement.value)), measurement.value)
 
-                    # --- PER SENSOR STATS ---
                     sensor_current = await pipe.hgetall(sensor_stats_key)
+
                     s_count = int(sensor_current.get("count", 0)) + 1
                     s_sum = float(sensor_current.get("sum", 0)) + measurement.value
                     s_min = min(float(sensor_current.get("min", measurement.value)), measurement.value)
                     s_max = max(float(sensor_current.get("max", measurement.value)), measurement.value)
 
-                    # Prepare recent entry
                     recent_entry = json.dumps({
                         "ts": measurement.ts_unix_ms,
                         "value": measurement.value
@@ -116,7 +65,6 @@ class AggregationStoreAsync:
 
                     pipe.multi()
 
-                    # Update global
                     pipe.hset(type_loc_key, mapping={
                         "count": g_count,
                         "sum": g_sum,
@@ -124,7 +72,6 @@ class AggregationStoreAsync:
                         "max": g_max,
                     })
 
-                    # Update per-sensor stats
                     pipe.hset(sensor_stats_key, mapping={
                         "count": s_count,
                         "sum": s_sum,
@@ -132,18 +79,19 @@ class AggregationStoreAsync:
                         "max": s_max,
                     })
 
-                    # Update recent list (keep last 20)
                     pipe.lpush(sensor_recent_key, recent_entry)
                     pipe.ltrim(sensor_recent_key, 0, 19)
 
                     await pipe.execute()
                     break
 
-                except redis.WatchError:
-                    continue
-    
+            except redis.WatchError:
+                continue
+
     async def snapshot(self):
+
         keys = await redis_client.keys("agg:*")
+
         result = {}
 
         for key in keys:
@@ -152,137 +100,151 @@ class AggregationStoreAsync:
 
         return result
 
+
 store = AggregationStoreAsync()
 
 
-# ----------------------------------------------------------
-# 1️⃣ Client-streaming ingestion service
-# ----------------------------------------------------------
+# --------------------------------------------------
+# Ingest Service (Client Streaming)
+# --------------------------------------------------
+
 class IngestService(telemetry_pb2_grpc.IngestServiceServicer):
 
     async def PushMeasurements(self, request_iterator, context):
-        """
-        Placeholder implementation.
 
-        Future tasks:
-        - Iterate over request_iterator.
-        - Update Redis aggregation.
-        - Maintain per-sensor recent values.
-        """
-
-        print("[Collector] IngestService placeholder active")
+        print("[Collector] IngestService active")
 
         received = 0
 
         async for measurement in request_iterator:
+
             received += 1
+
             print(
-                f"[Ingest placeholder] "
-                f"{measurement.meta.sensor_id} "
+                f"[Ingest] {measurement.meta.sensor_id} "
+                f"{measurement.meta.sensor_type}@{measurement.meta.location} "
                 f"value={measurement.value:.2f}"
             )
+
+            await store.update(measurement)
 
         return telemetry_pb2.IngestAck(received=received)
 
 
-# ----------------------------------------------------------
-# 2️⃣ Server-streaming aggregate service
-# ----------------------------------------------------------
+# --------------------------------------------------
+# Aggregate Streaming Service (placeholder streaming)
+# --------------------------------------------------
+
 class AggregateService(telemetry_pb2_grpc.AggregateServiceServicer):
 
     async def StreamAggregates(self, request, context):
-        """
-        Placeholder implementation.
 
-        Future tasks:
-        - Read aggregates from Redis.
-        - Stream updated values periodically.
-        """
-
-        print("[Collector] AggregateService placeholder active")
+        print("[Collector] AggregateService active")
 
         while True:
-            yield telemetry_pb2.Aggregate(
-                key=telemetry_pb2.AggregateKey(
-                    sensor_type="placeholder",
-                    location="placeholder",
-                ),
-                count=0,
-                sum=0.0,
-                min=0.0,
-                max=0.0,
-                updated_unix_ms=int(time.time() * 1000),
-            )
+
+            snap = await store.snapshot()
+
+            for key, v in snap.items():
+
+                if not v:
+                    continue
+
+                count = int(v["count"])
+                sum_v = float(v["sum"])
+
+                avg = sum_v / count if count else 0
+
+                yield telemetry_pb2.Aggregate(
+                    key=telemetry_pb2.AggregateKey(
+                        sensor_type=key.split(":")[1],
+                        location=key.split(":")[2],
+                    ),
+                    count=count,
+                    sum=sum_v,
+                    min=float(v["min"]),
+                    max=float(v["max"]),
+                    updated_unix_ms=int(time.time() * 1000),
+                )
 
             await asyncio.sleep(5)
-                    
-# ----------------------------------------------------------
-# 3️⃣ Unary query service
-# ----------------------------------------------------------
+
+
+# --------------------------------------------------
+# Query Service
+# --------------------------------------------------
+
 class QueryService(telemetry_pb2_grpc.QueryServiceServicer):
 
     async def GetSensorStats(self, request, context):
-        """
-        Placeholder implementation.
 
-        Future tasks:
-        - Retrieve per-sensor stats from Redis.
-        - Return recent values.
-        """
+        sensor_stats_key = f"sensor:{request.sensor_id}:stats"
+        sensor_recent_key = f"sensor:{request.sensor_id}:recent"
 
-        print(f"[Query placeholder] sensor={request.sensor_id}")
+        stats = await redis_client.hgetall(sensor_stats_key)
+        recent_raw = await redis_client.lrange(sensor_recent_key, 0, 19)
+
+        recent_values = []
+
+        for entry in recent_raw:
+            obj = json.loads(entry)
+            recent_values.append(
+                telemetry_pb2.RecentValue(
+                    value=float(obj["value"]),
+                    timestamp_ms=int(obj["ts"])
+                )
+            )
 
         return telemetry_pb2.GetSensorStatsResponse(
-            meta=telemetry_pb2.SensorMeta(
-                sensor_id=request.sensor_id,
-                sensor_type="placeholder",
-                location="placeholder",
-            ),
-            count=0,
-            sum=0.0,
-            min=0.0,
-            max=0.0,
-            updated_unix_ms=int(time.time() * 1000),
-            recent=[],
+            sensor_id=request.sensor_id,
+            recent_values=recent_values
         )
-    
-            
 
 
-# -----------------------------
-# Periodic stats printer
-# -----------------------------
+# --------------------------------------------------
+# Stats Printer
+# --------------------------------------------------
+
 async def stats_printer():
+
     while True:
+
         await asyncio.sleep(5)
+
         snap = await store.snapshot()
 
         print("\n===== REDIS AGGREGATES =====")
+
         for key, v in snap.items():
+
             if not v:
                 continue
-            
+
             count = int(v["count"])
             sum_v = float(v["sum"])
-            
+
             avg = sum_v / count if count else 0
+
             print(
-                f"{key} count = {count} avg={avg:.2f} "
-                f"min={float(v["min"]):.2f} max={float(v["max"]):.2f}"
+                f"{key} count={count} avg={avg:.2f} "
+                f"min={float(v['min']):.2f} max={float(v['max']):.2f}"
             )
+
         print("============================\n")
 
 
-# -----------------------------
-# Server bootstrap
-# -----------------------------
+# --------------------------------------------------
+# Server Bootstrap
+# --------------------------------------------------
+
 async def serve(port: int):
+
     server = grpc.aio.server()
 
     telemetry_pb2_grpc.add_IngestServiceServicer_to_server(
         IngestService(), server
     )
-    
+
     telemetry_pb2_grpc.add_AggregateServiceServicer_to_server(
         AggregateService(), server
     )
@@ -291,10 +253,10 @@ async def serve(port: int):
         QueryService(), server
     )
 
-
     server.add_insecure_port(f"[::]:{port}")
 
     await server.start()
+
     print(f"Collector running on :{port}")
 
     asyncio.create_task(stats_printer())
@@ -302,9 +264,14 @@ async def serve(port: int):
     await server.wait_for_termination()
 
 
+# --------------------------------------------------
+
 if __name__ == "__main__":
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=50051)
+
     args = ap.parse_args()
-    preferred_port = args.port
-    asyncio.run(serve(preferred_port))
+
+    asyncio.run(serve(args.port))
+    
